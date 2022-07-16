@@ -3,6 +3,11 @@ nagios check for QNAP NAS
 
 # NOTES
 This script runs on a nagios server, and queries a QNAP NAS device via SNMP for the following metrics
+- SMART errors
+- Physical disk errors
+- Logical disk errors
+- Power supply health
+- Disk temperature
 
 # ASSUMPTIONS
 SNMP is enabled on QNAP NAS
