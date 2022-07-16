@@ -1,0 +1,1013 @@
+#!/usr/bin/perl
+
+
+# OUTSTANDING TASKS
+# -----------------
+# See if you can find any more interesting SNMP OIDs in the enterprise MIB.  Maybe health metrics like fan speed, ambient temperature, etc.
+# Add a check for free space on logical volumes sysVolumeSize - sysVolumeFree
+# Add a check for ambient temperature in addition to individual disk drive temperature readings.
+# Add a check for CPU utilization
+
+
+# CHANGE LOG
+# ----------
+# 2022/06/02	njeffrey	Script created to monitor SMART disk metrics on QNAP NAS devices
+# 2022/07/16	njeffrey	SNMP queries will sometimes timeout if there is a disk failure, so execute this script from a cron job and create temporary file for reading to avoid nagios timeouts
+
+
+# nagios shell script to query QNAP NAS devices to read SMART disk health metrics via SNMP
+
+
+# NOTES
+# -----
+#
+#  SNMP will need to be enabled on the QNAP NAS device.
+#
+#  This script should return one (and only one) line of ouput.  Multiple
+#  lines of output are silently ignored by nagios.
+#
+#  The line of output will become the body of the alert message sent by nagios
+#
+#
+#  This script queries a remote host via SNMP
+#
+#  You will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#      # Define a service to check the SuperMicro IPMI
+#      # Parameters are SNMP community name
+#      define service {
+#              use                             generic-service
+#              hostgroup_name                  all_qnap_nas
+#              service_description             QNAP NAS Health
+#              check_command                   check_qnap_nas!public
+#              }
+#
+#
+#  You will also need a command definition similar to the following in commands.cfg on the nagios server
+#      # 'check_qnap_nas' command definition
+#      # parameters are -H hostname -C snmp_community
+#      define command{
+#              command_name    check_qnap_nas
+#              command_line    $USER1$/check_qnap_nas -H $HOSTADDRESS$ -C $ARG1$
+#              }
+#
+#
+# Since this script can take up to 10 minutes to run, it often times out when run via nagios.
+# # Schedule this script to run every 15 minutes via cron, then have nagios just read the output file from the cron job.
+# # Create cron entries in the nagios user crontab similar to the following:  (one for each QNAP NAS in your environment)
+# #   1,16,31,46 * * * * /usr/local/nagios/libexec/check_qnap_nas -H mynas01 -C public  > /dev/null 2>&1  #run via cron every 15 minutes in case the script times out in nagios
+# #   2,17,32,47 * * * * /usr/local/nagios/libexec/check_qnap_nas -H mynas02 -C public  > /dev/null 2>&1  #run via cron every 15 minutes in case the script times out in nagios
+#
+#
+
+# Different QNAP NAS models use slightly different OID values.  
+#
+# Model: QNAP TVS-1271U-RP with virmware 5.0
+#
+#
+# .1.3.6.1.4.1.24681.1.4.1.1.1.1.1.2.1.3.1 = STRING: "TVS-1271U-RP"    <---- NAS model
+# .1.3.6.1.4.1.24681.1.4.1.1.1.1.1.2.1.4.1 = STRING: "Q15CI10580"      <---- NAS serial number
+#
+# .1.3.6.1.4.1.24681.1.2.11.1.     has the  following sections:
+# .1.3.6.1.4.1.24681.1.2.11.1.1.x  Drive bay index (may or may not be occupied by a disk)
+# .1.3.6.1.4.1.24681.1.2.11.1.2.x  Drive bay name  (may or may not be occupied by a disk)
+# .1.3.6.1.4.1.24681.1.2.11.1.3.x  Disk temperature
+# .1.3.6.1.4.1.24681.1.2.11.1.4.x  0=ready -4=unknown -5=noDisk -6=invalid -9=rwError
+# .1.3.6.1.4.1.24681.1.2.11.1.5.x  Disk model type
+# .1.3.6.1.4.1.24681.1.2.11.1.6.x  Disk size
+# .1.3.6.1.4.1.24681.1.2.11.1.7.x  Disk status
+#
+# Example output (snipped to only show 3 disks)
+# $ snmpwalk -v 1 -c public 172.19.0.222 .1.3.6.1.4.1.24681.1.2.11.1
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.1.1 = INTEGER: 1                           <--- drive bay index
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.1.2 = INTEGER: 2
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.1.3 = INTEGER: 3
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.2.1 = STRING: "HDD1"                       <--- drive bay description
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.2.2 = STRING: "HDD2"
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.2.2 = STRING: "HDD3"
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.3.1 = STRING: "40 C/104 F"                 <--- temperature
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.3.2 = STRING: "41 C/105 F"
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.3.3 = STRING: "-- C/-- F"                  <--- no temperaute reading means no disk in this drive bay
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.4.1 = INTEGER: 0                           <--- 0=drive present  -5=no drive present
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.4.2 = INTEGER: 0
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.4.3 = INTEGER: -5
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.5.1 = STRING: "ST8000NE0001-1WN112"        <--- drive model
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.5.2 = STRING: "ST8000NE0001-1WN112"
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.5.2 = STRING: "--"                         <--- indicates no disk in this drive bay
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.6.1 = STRING: "7.28 TB"                    <--- size
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.6.2 = STRING: "7.28 TB"
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.6.3 = STRING: "--"                         <--- indicates no disk in this drive bay
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.7.1 = STRING: "GOOD"                       <--- SMART health
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.7.2 = STRING: "GOOD"
+# SNMPv2-SMI::enterprises.24681.1.2.11.1.7.3 = STRING: "--"                         <--- indicates no disk in this drive bay
+#
+#  There will be one or more logical volumes created on the RAID arrays.
+#    sysVolumeEntry
+#    sysVolumeIndex     1.3.6.1.4.1.24681.1.2.17.1.1
+#    sysvolumeDescr     1.3.6.1.4.1.24681.1.2.17.1.2
+#    sysvolumeFS        1.3.6.1.4.1.24681.1.2.17.1.3
+#    sysVolumeTotalSize 1.3.6.1.4.1.24681.1.2.17.1.4
+#    sysVolumeFreeSize  1.3.6.1.4.1.24681.1.2.17.1.5
+#    sysVolumeStatus    1.3.6.1.4.1.24681.1.2.17.1.6
+#  For example:
+# .1.3.6.1.4.1.24681.1.2.17.1.1.1 = INTEGER: 1
+# .1.3.6.1.4.1.24681.1.2.17.1.2.1 = STRING: "[Volume DataVol1, Pool 1]"
+# .1.3.6.1.4.1.24681.1.2.17.1.3.1 = STRING: "--"
+# .1.3.6.1.4.1.24681.1.2.17.1.4.1 = STRING: "11.53 TB"
+# .1.3.6.1.4.1.24681.1.2.17.1.5.1 = STRING: "11.52 TB"
+# .1.3.6.1.4.1.24681.1.2.17.1.6.1 = STRING: "Warning"     <---- Values are Ready, Warning, Critical
+#
+#
+# Ambient temperature 
+#  .1.3.6.1.4.1.24681.1.2.6.0 .iso.org.dod.internet.private.enterprises.storage.storageSystem.SystemInfo.SystemTemperature.0
+#    $ /usr/bin/snmpget -Ona -v 1 -c public 172.19.0.222 .1.3.6.1.4.1.24681.1.2.6.0
+#   .1.3.6.1.4.1.24681.1.2.6.0 = STRING: "39 C/102 F"
+#
+# QTS-MIB::systemTemperature  .1.3.6.1.4.1.55062.1.12.11  Overall system temperature in degrees celsius
+# QTS-MIB::systemCPU-Usage    .1.3.6.1.4.1.55062.1.12.12  Overall CPU usage averaged across all cores
+# QTS-MIB::systemTotalMem     .1.3.6.1.4.1.55062.1.12.13  System total memory in bytes
+# QTS-MIB::systemFreeMem      .1.3.6.1.4.1.55062.1.12.14  System free memory in bytes
+# QTS-MIB::systemAvailableMem .1.3.6.1.4.1.55062.1.12.15  System available memory in bytes
+# QTS-MIB::systemUsedMem      .1.3.6.1.4.1.55062.1.12.16  System used memory in bytes
+# QTS-MIB::systemCacheMem     .1.3.6.1.4.1.55062.1.12.17  System cached memory in bytes
+# QTS-MIB::systemBufferMem    .1.3.6.1.4.1.55062.1.12.18  System buffered memory in bytes
+# QTS-MIB::sysPowerStatus     .1.3.6.1.4.1.55062.1.12.19  System power status 0=ok -1=failed
+# QTS-MIB::sysUPSStatus       .1.3.6.1.4.1.55062.1.12.20  System UPS status 0=ok -1=failed
+#
+# To see % CPU utilization on each individual processor core:
+# $ /usr/bin/snmpwalk -Ona -v 1 -c public mynas.example.com .1.3.6.1.4.1.24681.1.4.1.1.1.1.4.3.1.3
+# .1.3.6.1.4.1.24681.1.4.1.1.1.1.4.3.1.3.1 = INTEGER: 7
+# .1.3.6.1.4.1.24681.1.4.1.1.1.1.4.3.1.3.2 = INTEGER: 6
+# .1.3.6.1.4.1.24681.1.4.1.1.1.1.4.3.1.3.3 = INTEGER: 8
+# .1.3.6.1.4.1.24681.1.4.1.1.1.1.4.3.1.3.4 = INTEGER: 6
+#
+#
+use strict;				#enforce good coding practices
+use Getopt::Long;                       #allow --long-switches to be used as parameters.  Install with: perl -MCPAN -e 'install Getopt::Long'
+
+
+
+# declare variables
+my ($OK,$WARN,$CRITICAL,$UNKNOWN);
+my ($CHECK_NAME,$cmd,$snmpwalk,$snmpget);
+my ($host,$temp_oid,$base_oid,$oid_label,$oid,$key,%disks,%nas,$community);
+my ($ping,$pingstatus,$nslookup,$nslookup_status,$outputfile,$output_message);
+my ($epoch,$dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
+my ($opt_h,$opt_v,$opt_w,$opt_c,$opt_C,$opt_H);
+my ($verbose,$common_output_data,$perf_data);
+my ($send_email,$email_to,$email_subject);
+$cmd = "";                                              #initialize variable
+$CHECK_NAME                 = "QNAP NAS Health";	#name of nagios check
+$verbose                    = "no";                    	#yes/no variable to increase output for debugging
+#$cpu_temp_warn              = 60;			#warn if CPU temperature reaches this value in degrees celsius
+#$cpu_temp_crit              = 65;			#critical if CPU temperature reaches this value in degrees celsius
+#$system_temp_warn           = 40;			#warn if motherboard temperature sensor reaches this value in degres celsius
+#$system_temp_crit           = 45;			#critical if motherboard temperature sensor reaches this value in degres celsius
+$community                  = "public";  		#default SNMP community name
+$common_output_data         = "";			#initialize variable to hold details of script output
+$snmpwalk                   = "/usr/bin/snmpwalk";	#location of binary
+$snmpget                    = "/usr/bin/snmpget";	#location of binary
+$ping                       = "/bin/ping";              #location of binary
+$nslookup                   = "/bin/nslookup";          #location of binary
+$send_email                 = "no";                     #yes/no flag.  Choose no if script runs from nagios, choose yes if running from cron.
+$email_to                   = "itsupport\@example.com"; #comma separated list of email recipients
+$email_subject              = "QNAP alert";             #subject of email
+
+
+#
+# Nagios return codes
+#
+$OK=            0;
+$WARN=          1;
+$CRITICAL=      2;
+$UNKNOWN=       3;
+
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   print "running get_options subroutine \n" if ($verbose eq "yes");
+   #
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"        => \$opt_h,
+      "v"   => \$opt_v, "verbose"     => \$opt_v,
+      "C=s" => \$opt_C, "community=s" => \$opt_C, "comm=s" => \$opt_C,
+      "H=s" => \$opt_H, "hostname=s"  => \$opt_H, "host=s" => \$opt_H,
+   );
+   #
+   #
+   #
+   # If the user supplied -h or --help, generate the help messages
+   #
+   if( defined( $opt_h ) ) {
+      print "Nagios plugin for determining filesystem usage. \n";
+      print "Examples: \n";
+      print "   $0 --host=myfiler --community=public \n";
+      print "   $0     -H myfiler          -C public \n";
+      print "\n\n";
+      exit $UNKNOWN;
+   }
+   #
+   # If the user supplied -v or --verbose, increase verbosity for debugging
+   if( defined( $opt_v ) ) {
+      $verbose = "yes";
+   } 
+   #
+   #
+   # If the user did not supply a --community SNMP community string, use "public"
+   #
+   if( defined( $opt_C ) ) {
+      $community = $opt_C;
+   } else {
+      $community = "public";
+   }
+   #
+   # If the user did not supply a --host=??? , generate a warning
+   #
+   if( defined( $opt_H ) ) {
+      $host = $opt_H;
+   } else {
+      print "$CHECK_NAME UNKNOWN - a remote host to check was not provided. Use this syntax: $0 -H hostname -C snmp_community\n";
+      exit $CRITICAL;                                           #exit script
+   }
+   #
+   print "host=$host community=$community \n" if ($verbose eq "yes");
+}                       #end of subroutine
+
+
+
+
+
+sub sanity_checks {
+   #
+   #
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   if ( ! -f "$snmpwalk" ) {
+      print "ERROR: Cannot find $snmpwalk \n";
+      exit;
+   }
+   if ( ! -x "$snmpwalk" ) {
+      print "ERROR: $snmpwalk is not executable by the current user\n";
+      exit;
+   }
+   if ( ! -f "$snmpget" ) {
+      print "ERROR: Cannot find $snmpget \n";
+      exit;
+   }
+   if ( ! -x "$snmpget" ) {
+      print "ERROR: $snmpget is not executable by the current user\n";
+      exit;
+   }
+   if ( ! -f "$nslookup" ) {
+      print "ERROR: Cannot find $nslookup \n";
+      exit;
+   }
+   if ( ! -x "$nslookup" ) {
+      print "ERROR: $nslookup is not executable by the current user\n";
+      exit;
+   }
+   $ping = "/bin/ping"     if ( -f "/bin/ping");        #different UNIX flavours put binary in different places
+   $ping = "/etc/ping"     if ( -f "/etc/ping");        #different UNIX flavours put binary in different places
+   $ping = "/usr/bin/ping" if ( -f "/usr/bin/ping");    #different UNIX flavours put binary in different places
+   if( ! -f $ping ) {
+      print "$CHECK_NAME Unknown - cannot locate $ping binary\n";
+      exit $UNKNOWN;                            #exit script
+   }                                            #end of if block
+   if( ! -x  $ping ) {
+      print "$CHECK_NAME Unknown - $ping is not executable\n";
+      exit $UNKNOWN;                            #exit script
+   }                                            #end of if block
+}                                                       #end of subroutine
+
+
+
+
+sub send_email_alert {
+   #
+   print "running send_email_alert subroutine \n" if ($verbose eq "yes");
+   #
+   # This subroutine only runs if the $send_email variable is set to "yes".
+   # This subroutine is used to send email directly from the script, rather than letting nagios handle the alerts.
+   # You must set $send_email="yes" if this script is being run from cron instead of from nagios
+   #
+   return unless ( $send_email eq "yes" );                                      #exit from subroutine
+   #
+   $cmd = "echo \"$output_message\" \| mail -s \"$email_subject\" $email_to";           #define command to be run
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open(MAIL,"$cmd |") or die "$!\n";
+   close MAIL;                                                                  #close filehandle
+}
+
+
+
+
+sub check_name_resolution {
+   #
+   print "running check_name_resolution subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm valid name resolution exists for $host
+   #
+   if( ! open( NSLOOKUP, "$nslookup $host 2>&1|" ) ) {
+      warn "WARNING: nslookup $host failed: $!\n";
+      return 0;
+   }
+   while (<NSLOOKUP>) {                                                         #read a line from STDIN
+      if (/failed/) {                                                           #look for error message from nslookup
+         $nslookup_status = "failed";                                           #set flag value for $nslookup variable
+      }                                                                         #end of if block
+      if (/SERVFAIL/) {                                                         #look for error message from nslookup
+         $nslookup_status = "failed";                                           #set flag value for $nslookup variable
+      }                                                                         #end of if block
+   }                                                                            #end of while loop
+   close NSLOOKUP;                                                              #close filehandle
+   if ( $nslookup_status eq "failed" ) {                                        #check for flag value
+      print "$CHECK_NAME CRITICAL: no name resolution for $host - please add $host to DNS \n";
+      exit $CRITICAL;                                                           #exit script
+   }                                                                            #end of if block
+}
+
+
+
+
+sub ping_remote_host {
+   #
+   print "running ping_remote_host subroutine \n" if ($verbose eq "yes");
+   #
+   # Confirm the remote host is up
+   #
+   print "   trying to ping $host \n" if ($verbose eq "yes");
+   $cmd = "$ping -c 1 -w 1 $host";
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd 2>&1|");                       #send a single ping to the remote host and wait 1 second for a reply
+   while (<IN>) {                                  #read a line from STDIN
+      if ( /1 packets transmitted, 1 received, 0% packet loss/ ) {                  #ping success
+         print "   ping check succeeded \n" if ($verbose eq "yes");
+      }                                         #end of if block
+      if ( /100% packet loss/ ) {                  #check for ping timeouts (indicates host may be down)
+         $pingstatus = "$CHECK_NAME UNKNOWN -- no ping reply from $host \n";
+          print $pingstatus;                        #print error message
+          exit $UNKNOWN;                            #exit script
+      }                                            #end of if block
+      if ( /NOT FOUND/ ) {                         #check for invalid hostname (using AIX ping)
+         $pingstatus = "$CHECK_NAME UNKNOWN -- could not resolve hostname $host - please check DNS\n";
+         print $pingstatus;                        #print error message
+         exit $UNKNOWN;                            #exit script
+      }                                            #end of if block
+      if ( /Name or service not known/ ) {         #check for invalid hostname (using Linux ping)
+         $pingstatus = "$CHECK_NAME UNKNOWN -- could not resolve hostname $host - please check DNS\n";
+         print $pingstatus;                        #print error message
+         exit $UNKNOWN;                            #exit script
+      }                                            #end of if block
+      if ( /unknown host/ ) {                      #check for invalid hostname (using Linux ping)
+         $pingstatus = "$CHECK_NAME UNKNOWN -- could not resolve hostname $host - please check DNS\n";
+         print $pingstatus;                        #print error message
+         exit $UNKNOWN;                            #exit script
+      }                                            #end of if block
+      if ( /no route to host/ ) {                  #check for routing problems
+         $pingstatus = "$CHECK_NAME UNKNOWN -- could not find a route to $host - check routing tables \n";
+         print $pingstatus;                        #print error message
+         exit $UNKNOWN;                            #exit script
+      }                                            #end of if block
+   }                                               #end of while loop
+   close IN;                                       #close filehandle
+}                                                       #end of subroutine
+
+
+
+
+
+
+sub check_for_output_file {
+   #
+   # a cron job may have already created the output file that we need
+   #
+   print "running check_for_output_file subroutine \n" if ($verbose eq "yes");
+   #
+   unless ($host) {
+      print "$CHECK_NAME UNKNOWN - Could not determine hostname or IP address for host $host \n";
+      exit $UNKNOWN;
+   }                                                                            #end of unless block
+   $outputfile = "/tmp/nagios.check_qnap_nas.$host";                             #name of temporary file
+   print"   checking for existence of temporary file $outputfile \n" if ($verbose eq "yes");
+   #
+   # delete the output file if it is more than 15 minutes old
+   if ( -e "$outputfile" ) {                                                    #see if a cron job has already provided the info we need
+      $epoch = time();                                                          #number of seconds since the epoch
+      ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($outputfile);
+      if ( ($epoch - $mtime) > (60 * 15) ) {                                    #mtime is last file modification time in seconds since the epoch
+         print "   deleting obsolete file $outputfile \n" if ($verbose eq "yes");
+         unlink "$outputfile";                                                  #delete file if it is too old to be of any use
+         # confirm the file was deleted
+         if ( -e "$outputfile" ) {
+            print "$CHECK_NAME UNKNOWN - Could not delete temporary file $outputfile - please check file permissions \n";
+            exit $UNKNOWN;
+         }                                                                      #end of if block
+      }                                                                         #end of if block
+   }                                                                            #end of if block
+   #
+   if ( -e "$outputfile" ) {                                                    #see if a cron job has already provided the info we need
+      print "   found existing file $outputfile - using that for check output \n" if ($verbose eq "yes");
+      open (OUT,"$outputfile") or die "Cannot open $outputfile for reading $! \n";
+      while (<OUT>) {                                                           #read a line from the text file
+         $output_message = $_  if ( $_ =~ /[a-zA-Z]/);                          #get the content of the output file into a variable
+      }                                                                         #end of while loop
+      close OUT;                                                                #close filehandle
+      print $output_message;                                                    #print the content of the output file
+      exit $CRITICAL if ( $output_message =~ /CRITICAL/ );                      #exit script with appropriate return code
+      exit $WARN     if ( $output_message =~ /WARN/ );                          #exit script with appropriate return code
+      exit $UNKNOWN  if ( $output_message =~ /UNKNOWN/ );                       #exit script with appropriate return code
+      exit $OK       if ( $output_message =~ /OK/ );                            #exit script with appropriate return code
+      exit $UNKNOWN;                                                            #only get this far if OK/WARN/CRITICAL/UNKNOWN was not found in the output file
+   }                                                                            #end of if block
+}                                                                               #end of subroutine
+
+
+
+
+sub print_to_outputfile {
+   #
+   print "running print_to_outputfile \n" if ($verbose eq "yes");
+   #
+   # This subroutine is called whenever an output message is printed, to confirm that the $outputfile exists
+   #
+   # confirm the output message exists
+   unless ($output_message =~ /[a-zA-Z]+/ ) {					#check to see if $output_message is empty
+      print "   ERROR - possible script bug, cannot find anything in the \$output_message variable \n" if ($verbose eq "yes");
+      $output_message = "$CHECK_NAME UNKNOWN - could not parse response from storage system \n";
+   }										#end of unless block
+   print "   Writing this value to outputfile $outputfile : $output_message " if ($verbose eq "yes");
+   #
+   # confirm the $outputfile variable is defined
+   unless ($outputfile) {
+      print "$CHECK_NAME UNKNOWN - the \$outputfile variable is not defined.  This might be a script bug. \n";
+      exit $UNKNOWN;                                                            #only get this far if OK/WARN/CRITICAL/UNKNOWN was not found in the output file
+   }                                                                            #end of unless block
+   #
+   if ( ! -e "$outputfile" ) {                                                  #only run this section if $outputfile does not already exist
+      print "   $outputfile not found - writing output message to $outputfile \n" if ($verbose eq "yes");
+      open (OUT,">$outputfile") or die "Cannot open $outputfile for writing: $! \n";
+      print OUT "$output_message";
+      close OUT;                                                                #close filehandle
+   }                                                                            #end of if block
+}                                                                               #end of subroutine
+
+
+
+
+sub get_nas_details {
+   #
+   # query the SNMP counters on the QNAP to get the model,serial,etc
+   #
+   print "running get_nas_details subroutine \n" if ($verbose eq "yes");
+   #
+   # get model number
+   #
+   $nas{model} = "unknown";						#initialize hash element
+   $base_oid = ".1.3.6.1.4.1.24681.1.4.1.1.1.1.1.2.1.3.1";                             
+   $cmd = "$snmpget -Ona -v 1 -c $community $host ${base_oid}";               #use -Ona to convert the Hex-String output to human readable ASCII
+   print "   running command to find NAS model number:  $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      #
+      # looking for output similar to:  
+      # .1.3.6.1.4.1.24681.1.4.1.1.1.1.1.2.1.3.1 = STRING: "TVS-1271U-RP"    <---- NAS model
+      # .1.3.6.1.4.1.24681.1.4.1.1.1.1.1.2.1.3.1 = STRING: "Q217I01127"      <---- NAS model
+      #
+      #
+      s/"//g;								#remove " to make regex simpler
+      if ( /${base_oid} = STRING: ([a-zA-Z0-9\-]+)/ ) { 		#find the line with the text label we are looking for
+         print "    found NAS model $1  \n" if ($verbose eq "yes");
+         $nas{model}= $1;						# add to hash
+      } 								#end of if block
+   }                                                                    #end of while loop
+   close IN;								#close filehandle
+   #
+   # get serial number
+   #
+   $nas{serial} = "unknown";						#initialize hash element
+   $base_oid = ".1.3.6.1.4.1.24681.1.4.1.1.1.1.1.2.1.4.1";                             
+   $cmd = "$snmpget -Ona -v 1 -c $community $host ${base_oid}";               #use -Ona to convert the Hex-String output to human readable ASCII
+   print "   running command to find NAS serial number:  $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      #
+      # looking for output similar to:  
+      # .1.3.6.1.4.1.24681.1.4.1.1.1.1.1.2.1.4.1 = STRING: "Q15CI10580"      <---- NAS serial number
+      #
+      s/"//g;								#remove " to make regex simpler
+      if ( /${base_oid} = STRING: ([a-zA-Z0-9\-]+)/ ) { 		#find the line with the text label we are looking for
+         print "    found NAS serial number $1  \n" if ($verbose eq "yes");
+         $nas{serial}= $1;						# add to hash
+      } 								#end of if block
+   }                                                                    #end of while loop
+   close IN;								#close filehandle
+   #
+   # Get the details of the system fans
+   # .1.3.6.1.4.1.24681.1.3.15.1.1.1 = INTEGER: 1                    <--- fan index
+   # .1.3.6.1.4.1.24681.1.3.15.1.1.2 = INTEGER: 2
+   # .1.3.6.1.4.1.24681.1.3.15.1.1.3 = INTEGER: 3
+   # .1.3.6.1.4.1.24681.1.3.15.1.2.1 = STRING: "System FAN 1"        <--- fan description
+   # .1.3.6.1.4.1.24681.1.3.15.1.2.2 = STRING: "System FAN 2"
+   # .1.3.6.1.4.1.24681.1.3.15.1.2.3 = STRING: "System FAN 3"
+   # .1.3.6.1.4.1.24681.1.3.15.1.3.1 = INTEGER: 4477                 <--- fan RPM
+   # .1.3.6.1.4.1.24681.1.3.15.1.3.2 = INTEGER: 4702
+   # .1.3.6.1.4.1.24681.1.3.15.1.3.3 = INTEGER: 4761
+   #
+   $nas{fan_count} = 0;							#initialize counter
+   $base_oid = ".1.3.6.1.4.1.24681.1.3.15.1.1";                             #fan index
+   $cmd = "$snmpwalk -Ona -v 1 -c $community $host ${base_oid}";               #use -Ona to convert the Hex-String output to human readable ASCII
+   print "   running command to find NAS fans:  $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      #
+      # looking for output similar to:  
+      # .1.3.6.1.4.1.24681.1.3.15.1.1.1 = INTEGER: 1                    <--- fan index
+      # .1.3.6.1.4.1.24681.1.3.15.1.1.2 = INTEGER: 2
+      # .1.3.6.1.4.1.24681.1.3.15.1.1.3 = INTEGER: 3
+      #
+      s/"//g;								#remove " to make regex simpler
+      if ( /${base_oid}\.[0-9]+ = INTEGER: ([0-9]+)/ ) { 		#find the line with the text label we are looking for
+         print "    found NAS fan $1  \n" if ($verbose eq "yes");
+         $nas{fans}{$1}{index}= $1;					# add to hash
+         $nas{fan_count}++;						#increment counter
+      } 								#end of if block
+   }                                                                    #end of while loop
+   close IN;								#close filehandle
+   #
+   # Get the fan descriptive name
+   #
+   $base_oid = ".1.3.6.1.4.1.24681.1.3.15.1.2";                             #fan index
+   $cmd = "$snmpwalk -Ona -v 1 -c $community $host ${base_oid}";               #use -Ona to convert the Hex-String output to human readable ASCII
+   print "   running command to find NAS fan descriptions:  $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      #
+      # looking for output similar to:  
+      # .1.3.6.1.4.1.24681.1.3.15.1.2.1 = STRING: "System FAN 1"        <--- fan description
+      # .1.3.6.1.4.1.24681.1.3.15.1.2.2 = STRING: "System FAN 2"
+      # .1.3.6.1.4.1.24681.1.3.15.1.2.3 = STRING: "System FAN 3"
+      #
+      s/"//g;								#remove " to make regex simpler
+      if ( /${base_oid}\.([0-9]+) = INTEGER: ([0-9]+)/ ) { 		#find the line with the text label we are looking for
+         print "    found NAS fan $1 description $2 \n" if ($verbose eq "yes");
+         $nas{fans}{$1}{description}= $2;					# add to hash
+      } 								#end of if block
+   }                                                                    #end of while loop
+   close IN;								#close filehandle
+   #
+   # Get the fan RPMs
+   #
+   $nas{fan_rpm} = 0;							#initialize counter
+   $base_oid = ".1.3.6.1.4.1.24681.1.3.15.1.3";                         #fan index
+   $cmd = "$snmpwalk -Ona -v 1 -c $community $host ${base_oid}";        #use -Ona to convert the Hex-String output to human readable ASCII
+   print "   running command to find NAS fan RPMs:  $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      #
+      # looking for output similar to:  
+      # .1.3.6.1.4.1.24681.1.3.15.1.3.1 = INTEGER: 4477                 <--- fan RPM
+      # .1.3.6.1.4.1.24681.1.3.15.1.3.2 = INTEGER: 4702
+      # .1.3.6.1.4.1.24681.1.3.15.1.3.3 = INTEGER: 4761
+      #
+      s/"//g;								#remove " to make regex simpler
+      if ( /${base_oid}\.([0-9]+) = INTEGER: ([0-9]+)/ ) { 		#find the line with the text label we are looking for
+         print "    found NAS fan $1 RPM $2  \n" if ($verbose eq "yes");
+         $nas{fans}{$1}{rpm}= $2;					# add to hash
+         $nas{fan_rpm} = $nas{fan_rpm} + $2;				#running RPM total of all fans
+      } 								#end of if block
+   }                                                                    #end of while loop
+   close IN;								#close filehandle
+   $nas{fan_rpm} = $nas{fan_rpm} / $nas{fan_count};			#calculate average
+   $nas{fan_rpm}   = sprintf( "%.0f", $nas{fan_rpm});              	#truncate to 0 decimal place
+   #
+   # Get the status of the logical volumes (Ready, Warning, Critical)
+   #
+   $nas{sysvol_status} = "ok";						#initialize counter
+   $base_oid = ".1.3.6.1.4.1.24681.1.2.17.1.6";                         #sysvolstatus
+   $cmd = "$snmpwalk -Ona -v 1 -c $community $host ${base_oid}";        #use -Ona to convert the Hex-String output to human readable ASCII
+   print "   running command to find status of logical volumes:  $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      #
+      # looking for output similar to:  
+      #  $ /usr/bin/snmpwalk -Ona -v 1 -c public 172.19.0.222 .1.3.6.1.4.1.24681.1.2.17.1.6
+      #   .1.3.6.1.4.1.24681.1.2.17.1.6.1 = STRING: "Warning"           <--- first logical volume is in a Warning state
+      #   .1.3.6.1.4.1.24681.1.2.17.1.6.2 = STRING: "Ready"             <--- second logical volume is in Ready state.  This is equal to "ok"
+      #
+      s/"//g;								#remove " to make regex simpler
+      if ( /${base_oid}\.([0-9]+) = STRING: ([a-zA-Z]+)/ ) { 		#find the line with the text label we are looking for
+         print "    found logical volume $1 status $2  \n" if ($verbose eq "yes");
+         $nas{sysvol_status} = "ok"  if ( ($nas{sysvol_status} eq "ok") && ($2 eq "Ready") );	# only keep status as ok if all the logical volumes are in "Ready" state
+         $nas{sysvol_status} = $2    if ( $2 ne "Ready");	 				# if any of the logical volumes are not in "Ready" state, set to the returned value 
+      } 								#end of if block
+   }                                                                    #end of while loop
+   close IN;								#close filehandle
+   $nas{fan_rpm} = $nas{fan_rpm} / $nas{fan_count};			#calculate average
+   $nas{fan_rpm}   = sprintf( "%.0f", $nas{fan_rpm});              	#truncate to 0 decimal place
+   #
+   # Get the status of the power supplies 0=ok =1=failed
+   #
+   $nas{sysPowerStatus} = "unknown";					#initialize counter
+   $base_oid = ".1.3.6.1.4.1.55062.1.12.19.0";                         	#sysPowerSstatus
+   $cmd = "$snmpget -Ona -v 1 -c $community $host ${base_oid}";        	#use -Ona to convert the Hex-String output to human readable ASCII
+   print "   running command to find status of power supplies:  $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      #
+      # looking for output similar to:  
+      # $ /usr/bin/snmpget -Ona -v 1 -c public mynas.example.com .1.3.6.1.4.1.55062.1.12.19.0
+      # .1.3.6.1.4.1.55062.1.12.19.0 = INTEGER: 0
+      #
+      s/"//g;								#remove " to make regex simpler
+      if ( /${base_oid} = INTEGER: ([0-9\-]+)/ ) { 			#find the line with the text label we are looking for
+         print "    found power supply status $1  \n" if ($verbose eq "yes");
+         $nas{sysPowerStatus} = "ok"     if ($1 eq "0" );		#change integer to human readable text
+         $nas{sysPowerStatus} = "failed" if ($1 eq "-1");		#change integer to human readable text
+      } 								#end of if block
+   }                                                                    #end of while loop
+   close IN;								#close filehandle
+}                                                       		#end of subroutine
+
+
+
+sub get_disk_details {
+   #
+   # query the SNMP counters on the QNAP read the SMART metrics
+   #
+   print "running get_disk_details subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   #
+   #
+   $nas{drive_bay_count} = 0;						#initialize counter
+   $base_oid = ".1.3.6.1.4.1.24681.1.2.11.1.1";                            
+   $cmd = "$snmpwalk -Ona -v 1 -c $community $host ${base_oid}";       	#use -Ona to convert the Hex-String output to human readable ASCII
+   print "   running command to find disk index values:  $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      #
+      # looking for output similar to:  
+      #    .1.3.6.1.4.1.24681.1.2.11.1.1.1 = INTEGER: 1
+      #    .1.3.6.1.4.1.24681.1.2.11.1.1.2 = INTEGER: 2
+      #    .1.3.6.1.4.1.24681.1.2.11.1.1.3 = INTEGER: 3
+      #
+      #
+      if ( /${base_oid}\.[0-9]+ = INTEGER: ([0-9]+)/ ) { 		#find the line with the text label we are looking for
+         print "    found disk index $1  \n" if ($verbose eq "yes");
+         $disks{$1}{index} = $1;					# add to has using the disk index as the hash key
+         $nas{drive_bay_count}++;					#increment counter
+      } 								#end of if block
+   }                                                                    #end of while loop
+   close IN;								#close filehandle
+   #
+   #
+   # Now that we have the disk index values, capture the other disk metrics.
+   # At this point, the hash looks like this:
+   #    $disk{1}{index}        = 1
+   #    $disk{2}{index}        = 2
+   # And we want to get more values to make the hash look like this:
+   #    $disk{1}{index}         = 1
+   #            {description}   = "HDD1"
+   #            {temperature}   = "40 C/104 F"
+   #            {hdStatus}      = 0                      <---- 0=ready -4=unknown -5=noDisk -6=invalid -9=rwError
+   #            {drive_present} = "yes"                  <---- determine yes|no value based on value from hdStatus
+   #            {model}         = "ST8000NE0001-1WN112"
+   #            {size}          = "7.28 TB"
+   #            {health}        = "GOOD"
+   #    $disk{2}{index}         = 2
+   #            {description}   = "HDD1"
+   #            {temperature}   = "40 C/104 F"
+   #            {hdStatus}      = 0                      <---- 0=ready -4=unknown -5=noDisk -6=invalid -9=rwError
+   #            {drive_present} = "yes"                  <---- determine yes|no value based on value from hdStatus
+   #            {model}         = "ST8000NE0001-1WN112"
+   #            {size}          = "7.28 TB"
+   #            {health}        = "GOOD"
+   #
+   # 
+   #
+   # Get the drive bay location description
+   #
+   $base_oid = ".1.3.6.1.4.1.24681.1.2.11.1.2";                             
+   $cmd = "$snmpwalk -Ona -v 1 -c $community $host ${base_oid}";               #use -Ona to convert the Hex-String output to human readable ASCII
+   print "   running command to find drive bay location description values:  $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   	#get the index numbers of the LUNs
+   while (<IN>) {                                                       	#read a line from the command output
+      #
+      # looking for output similar to:  
+      #    .1.3.6.1.4.1.24681.1.2.11.1.2.1 = STRING: "HDD1"        <--- these drive bay descriptions will always be populated, even if there is no disk in the drive bay
+      #    .1.3.6.1.4.1.24681.1.2.11.1.2.2 = STRING: "HDD2"
+      #    .1.3.6.1.4.1.24681.1.2.11.1.2.3 = STRING: "HDD3"
+      #
+      #
+      s/"//g;										#get rid of " to make regex simpler
+      if ( /${base_oid}\.([0-9]+) = STRING: ([a-zA-Z0-9]+)/ ) { 			#find the line with the text label we are looking for
+         print "    found disk index $1 with description $2  \n" if ($verbose eq "yes");
+         $disks{$1}{drive_bay_description} = $2;					# add to has using the disk index as the hash key
+         $disks{$1}{temperature}           = "";					# initialize hash element to avoid undef errors
+         $disks{$1}{hdStatus}              = "";					# initialize hash element to avoid undef errors
+         $disks{$1}{drive_present}         = "";					# initialize hash element to avoid undef errors
+         $disks{$1}{model}                 = "";					# initialize hash element to avoid undef errors
+         $disks{$1}{size}                  = "";					# initialize hash element to avoid undef errors
+         $disks{$1}{health}                = "";					# initialize hash element to avoid undef errors
+      } 										#end of if block
+   }                                                                    		#end of while loop
+   close IN;										#close filehandle
+   #
+   # Get the disk temperature
+   #
+   $base_oid = ".1.3.6.1.4.1.24681.1.2.11.1.3";                             
+   $cmd = "$snmpwalk -Ona -v 1 -c $community $host ${base_oid}";               		#use -Ona to convert the Hex-String output to human readable ASCII
+   print "   running command to find disk temperature values:  $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   		#get the index numbers of the LUNs
+   while (<IN>) {                                                       		#read a line from the command output
+      #
+      # looking for output similar to:  
+      #    .1.3.6.1.4.1.24681.1.2.11.1.3.1 = STRING: "38 C/100 F"
+      #    .1.3.6.1.4.1.24681.1.2.11.1.3.2 = STRING: "35 C/95 F"
+      #    .1.3.6.1.4.1.24681.1.2.11.1.3.3 = STRING: "-- C/-- F"
+      #
+      #
+      #
+      s/"//g;										#get rid of " to make regex simpler
+      if ( /${base_oid}\.([0-9]+) = STRING: ([a-zA-Z0-9 \/\-]+)/ ) { 			#find the line with the text label we are looking for
+         print "    found disk index $1 with temperature $2  \n" if ($verbose eq "yes");
+         $disks{$1}{temperature} = $2;							# add to has using the disk index as the hash key
+         $disks{$1}{temperature} = 0 if ( $disks{$1}{temperature} =~ /\-\-/ );		# if the disk is not present, the temperature reading will be -- , change to 0 so we can do math against it
+      } 										#end of if block
+   }                                                                    		#end of while loop
+   close IN;										#close filehandle
+   #
+   # Check the status of the hard disk in the drive bay
+   #
+   $base_oid = ".1.3.6.1.4.1.24681.1.2.11.1.4";                             
+   $cmd = "$snmpwalk -Ona -v 1 -c $community $host ${base_oid}";               		#use -Ona to convert the Hex-String output to human readable ASCII
+   print "   running command to find disk drive status:  $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   		#get the index numbers of the LUNs
+   while (<IN>) {                                                       		#read a line from the command output
+      #
+      # looking for output similar to:  
+      #    .1.3.6.1.4.1.24681.1.2.11.1.4.1 = INTEGER: 0    <---- 0=ready -4=unknown -5=noDisk -6=invalid -9=rwError
+      #    .1.3.6.1.4.1.24681.1.2.11.1.4.2 = INTEGER: 0
+      #    .1.3.6.1.4.1.24681.1.2.11.1.4.3 = INTEGER: -5   <---- -5 indicates there is no disk present in the drive bay
+      #    .1.3.6.1.4.1.24681.1.2.11.1.4.4 = INTEGER: -9   <---- -9 indicates disk I/O errors 
+
+      #
+      #
+      #
+      s/"//g;										#get rid of " to make regex simpler
+      if ( /${base_oid}\.([0-9]+) = INTEGER: ([0-9\-]+)/ ) { 				#find the line with the text label we are looking for
+         print "    found disk index $1 with disk drive present status of $2  \n" if ($verbose eq "yes");
+         $disks{$1}{hdStatus} = $2;							# add to has using the disk index as the hash key
+         $disks{$1}{hdStatus} = "ready"   if ($disks{$1}{hdStatus} eq "0" );		# change from integer to human readable text
+         $disks{$1}{hdStatus} = "unknown" if ($disks{$1}{hdStatus} eq "-4");		# change from integer to human readable text
+         $disks{$1}{hdStatus} = "nodisk"  if ($disks{$1}{hdStatus} eq "-5");		# change from integer to human readable text
+         $disks{$1}{hdStatus} = "invalid" if ($disks{$1}{hdStatus} eq "-6");		# change from integer to human readable text
+         $disks{$1}{hdStatus} = "rwError" if ($disks{$1}{hdStatus} eq "-9");		# change from integer to human readable text
+         $disks{$1}{drive_present} = "";						#initialize value
+         $disks{$1}{drive_present} = "yes" if (($disks{$1}{hdStatus} eq "ready")   || ($disks{$1}{hdStatus} eq "rwError"));
+         $disks{$1}{drive_present} = "no"  if (($disks{$1}{hdStatus} eq "unknown") || ($disks{$1}{hdStatus} eq "nodisk") || ($disks{$1}{hdStatus} eq "invalid"));
+
+      } 										#end of if block
+   }                                                                   		 	#end of while loop
+   close IN;										#close filehandle
+   #
+   # Get the disk model
+   #
+   $nas{disk_count} = 0;								#initialize counter
+   $base_oid = ".1.3.6.1.4.1.24681.1.2.11.1.5";                             
+   $cmd = "$snmpwalk -Ona -v 1 -c $community $host ${base_oid}";               		#use -Ona to convert the Hex-String output to human readable ASCII
+   print "   running command to find disk model values:  $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   		#get the index numbers of the LUNs
+   while (<IN>) {                                                       		#read a line from the command output
+      #
+      # looking for output similar to:  
+      #    .1.3.6.1.4.1.24681.1.2.11.1.5.1 = STRING: "ST8000NE0001-1WN112"
+      #    .1.3.6.1.4.1.24681.1.2.11.1.5.2 = STRING: "ST8000NE0001-1WN112"
+      #    .1.3.6.1.4.1.24681.1.2.11.1.5.3 = STRING: "--"
+      #
+      s/"//g;										#get rid of " to make regex simpler
+      if ( /${base_oid}\.([0-9]+) = STRING: ([a-zA-Z0-9 \-]+)/ ) { 			#find the line with the text label we are looking for
+         print "    found disk index $1 model $2  \n" if ($verbose eq "yes");
+         $disks{$1}{model} = $2;							# add to has using the disk index as the hash key
+         $nas{disk_count}++ if ($disks{$1}{model} =~ /[A-Za-z0-9]+/);			#increment counter if a disk drive model type was found
+      } 										#end of if block
+   }                                                                    		#end of while loop
+   close IN;										#close filehandle
+   #
+   # Get the disk size
+   #
+   $base_oid = ".1.3.6.1.4.1.24681.1.2.11.1.6";                             
+   $cmd = "$snmpwalk -Ona -v 1 -c $community $host ${base_oid}";               #use -Ona to convert the Hex-String output to human readable ASCII
+   print "   running command to find disk size values:  $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   	#get the index numbers of the LUNs
+   while (<IN>) {                                                       	#read a line from the command output
+      #
+      # looking for output similar to:  
+      #    .1.3.6.1.4.1.24681.1.2.11.1.6.1 = STRING: "7.28 TB"
+      #    .1.3.6.1.4.1.24681.1.2.11.1.6.2 = STRING: "7.28 TB"
+      #    .1.3.6.1.4.1.24681.1.2.11.1.6.3 = STRING: "--"
+      #
+      #
+      s/"//g;									#get rid of " to make regex simpler
+      if ( /${base_oid}\.([0-9]+) = STRING: ([a-zA-Z0-9 \.\-]+)/ ) { 		#find the line with the text label we are looking for
+         print "    found disk index $1 size $2  \n" if ($verbose eq "yes");
+         $disks{$1}{size} = $2;							# add to has using the disk index as the hash key
+         $disks{$1}{size} = 0 if ( $disks{$1}{size} =~ /\-\-/ );		# if the drive is not present, the reported size will be -- , change to zero so we can do math against it
+      } 									#end of if block
+   }                                                                    	#end of while loop
+   close IN;									#close filehandle
+   #
+   # Get the disk health
+   #
+   $base_oid = ".1.3.6.1.4.1.24681.1.2.11.1.7";                             
+   $cmd = "$snmpwalk -Ona -v 1 -c $community $host ${base_oid}";        	#use -Ona to convert the Hex-String output to human readable ASCII
+   print "   running command to find disk health values:  $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   	#get the index numbers of the LUNs
+   while (<IN>) {                                                       	#read a line from the command output
+      #
+      # looking for output similar to:  
+      #    .1.3.6.1.4.1.24681.1.2.11.1.7.1 = STRING: "GOOD"
+      #    .1.3.6.1.4.1.24681.1.2.11.1.7.2 = STRING: "GOOD"
+      #    .1.3.6.1.4.1.24681.1.2.11.1.7.3 = STRING: "--"
+      #
+      #
+      s/"//g;									#get rid of " to make regex simpler
+      if ( /${base_oid}\.([0-9]+) = STRING: ([a-zA-Z\-]+)/ ) { 			#find the line with the text label we are looking for
+         print "    found disk index $1 health $2  \n" if ($verbose eq "yes");
+         $disks{$1}{health} = $2;						# add to has using the disk index as the hash key
+      } 									#end of if block
+   }                                                                    	#end of while loop
+   close IN;									#close filehandle
+   #
+   # print summary of each disk
+   foreach $key (sort keys %disks) {
+      print "   Drive bay:$disks{$key}{index} description:$disks{$key}{drive_bay_description} drive_present:$disks{$key}{drive_present} model:$disks{$key}{model} size:$disks{$key}{size} health:$disks{$key}{health} \n" if ($verbose eq "yes");
+   }										#end of foreach loop
+   #
+   # get the hdStatus of each disk.  Set to "ok" if all the disks are in "ready" state, alert if any one disk is unknown|missing|invalid|rwError
+   #
+   $nas{overall_hdStatus} = "ok";						#initialize counter
+   foreach $key (sort keys %disks) {
+      next unless ($disks{$key}{overall_hdStatus} eq "ok");			#if we have already found at least 1 bad disk, no need to keep checking for more
+      $nas{overall_hdStatus} = "BAD" if ( $disks{$key}{hdstatus} ne "ready" );	#set overall_hdStatus to BAD if at least one disk has a problem
+   }										#end of foreach loop
+   #
+   # get the SMART healh status of each disk.  Set to "GOOD" if all the disks are good, set to "BAD" if any disks are not "GOOD"
+   #
+   $nas{disk_smart_health} = "GOOD";						#initialize counter
+   foreach $key (sort keys %disks) {
+      next unless ($disks{$key}{drive_present} eq "yes");				#skip any missing hash elements
+      $nas{disk_smart_health} = "BAD" if ( $disks{$key}{health} ne "GOOD" );	#increment counter
+   }										#end of foreach loop
+   #
+   # get the average temperature of all the disks in celsius and fahreheit
+   # looking for output similar to:  
+   #    .1.3.6.1.4.1.24681.1.2.11.1.3.1 = STRING: "38 C/100 F"
+   #    .1.3.6.1.4.1.24681.1.2.11.1.3.2 = STRING: "35 C/95 F"
+   #    .1.3.6.1.4.1.24681.1.2.11.1.3.3 = STRING: "38 C/100 F"
+   #
+   $nas{disk_average_temperature_c} = 0;					#initialize variable
+   $nas{disk_average_temperature_f} = 0;					#initialize variable
+   foreach $key (sort keys %disks) {
+      next unless (defined($disks{$key}{temperature}));				#skip any missing hash elements
+      if ( $disks{$key}{temperature} =~ /([0-9]+) C\/([0-9]+) F/ ){		#parse out temperature in Celsius and Fahrenheit
+         $nas{disk_average_temperature_c} = $nas{disk_average_temperature_c} + $1;#add up all the disk temperature readings in C
+         $nas{disk_average_temperature_f} = $nas{disk_average_temperature_f} + $2;#add up all the disk temperature readings in F
+      }										#end of if block
+   }										#end of foreach loop
+   # calculate the average temperature across all the disks
+   if ( $nas{disk_count} > 0 ) {						#avoid divide by zero errors
+      $nas{disk_average_temperature_c} = $nas{disk_average_temperature_c} / $nas{disk_count};
+      $nas{disk_average_temperature_f} = $nas{disk_average_temperature_f} / $nas{disk_count};
+      # round to nearest .1 of a degree
+      $nas{disk_average_temperature_c}   = sprintf( "%.1f", $nas{disk_average_temperature_c});              #truncate to 1 decimal place
+      $nas{disk_average_temperature_f}   = sprintf( "%.1f", $nas{disk_average_temperature_f});              #truncate to 1 decimal place
+   }										#end of if block
+}										#end of subroutine
+
+
+
+
+
+
+sub print_output {
+   #
+   # print output in the format expected by nagios
+   #
+   print "running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   # The nagios performance data will be the same for all the outputs, so just put it in a variable that can be use by all the output options
+   #
+   # The format is:  label=value[UOM];[warn];[crit];[min];[max]
+   # On the "label=value" section is required.  The warn|crit|min|max entries are optional.
+   # You can have multiple items of perf data, just separate each section with a space
+   # UOM is Units Of Measurement.    Can be s=seconds B=bytes MB=megabytes %=percent c=counter
+   # You can use the standard nagios ranges and thresholds formats (examples below)
+   # Range definition   Generate an alert if x...
+   # ----------------   -------------------------
+   # 10                 < 0 or > 10, (outside the range of {0 .. 10})
+   # 10:                < 10, (outside {10 .. ∞})
+   # ~:10               > 10, (outside the range of {-∞ .. 10})
+   # 10:20              < 10 or > 20, (outside the range of {10 .. 20})
+   # @10:20             ≥ 10 and ≤ 20, (inside the range of {10 .. 20})
+   #
+   $perf_data = "AverageTemperatureC:$nas{disk_average_temperature_c};;;; AverageTemperatureF:$nas{disk_average_temperature_f};;;; fan_rpm:$nas{fan_rpm}";
+   #
+   #
+   # Much of the text of the output will be the same.  Put the common stuff in a variable so we can simplify the outputs
+   $common_output_data = "LogicalVolumes:$nas{sysvol_status} Disk_SMART_health:$nas{disk_smart_health} DriveBays:$nas{drive_bay_count} Disks:$nas{disk_count} AverageTemperature:$nas{disk_average_temperature_c}C/$nas{disk_average_temperature_f}F fan_count:$nas{fan_count} fan_rpm:$nas{fan_rpm} PowerSupply:$nas{sysPowerStatus} Model:$nas{model} Serial:$nas{serial}";
+   #
+   # Alert on logical volume errors
+   #
+   if ( $nas{sysvol_status} ne "ok" ) {
+      $output_message = "$CHECK_NAME WARN - logical volume state is $nas{sysvol_status}.   $common_output_data | $perf_data \n";
+      print "$output_message";     #print output to screen
+      print_to_outputfile;         #call subroutine to confirm the output is in the $outputfile used for subsequent script runs
+      send_email_alert;            #call subroutine to send email alert
+      exit $WARN;
+   }
+   #
+   # Alert on high average disk temperature
+   #
+   if ( $nas{disk_average_temperature_c} > 45 ) {
+      $output_message = "$CHECK_NAME WARN - average disk temperature is $nas{disk_average_temperature_c}C/$nas{disk_average_temperature_f}F.  The air conditioning or fans may have failed.   $common_output_data | $perf_data \n";
+      print "$output_message";     #print output to screen
+      print_to_outputfile;         #call subroutine to confirm the output is in the $outputfile used for subsequent script runs
+      send_email_alert;            #call subroutine to send email alert
+      exit $WARN;
+   }
+   #
+   # Alert on physical disk I/O errors
+   #
+   if ( $nas{hdStatus} ne "ok" ) {
+      # find the BAD disk(s)
+      foreach $key (sort keys %disks) {
+         if ( ($disks{$key}{drive_present} eq "yes") && ($disks{$key}{hdStatus} ne "ready") ){			 		#check each present disk for errors
+            $common_output_data = "$disks{$key}{drive_bay_description}_hdStatus:$disks{$key}{hdStatus} $common_output_data";  	#add a list the bad disk(s) to the output
+         }									#end of if block
+      }									#end of foreach loop
+      $output_message = "$CHECK_NAME WARN - Disk hdStatus error detected.  Please login to NAS web GUI and review the system health.   $common_output_data | $perf_data \n";
+      print "$output_message";     #print output to screen
+      print_to_outputfile;         #call subroutine to confirm the output is in the $outputfile used for subsequent script runs
+      send_email_alert;            #call subroutine to send email alert
+      exit $WARN;
+   }
+   #
+   # Alert on SMART disk error
+   #
+   if ( $nas{disk_smart_health} ne "GOOD" ) {
+      # find the BAD disk(s)
+      foreach $key (sort keys %disks) {
+         next unless ($disks{$key}{drive_present} eq "yes");		#only check health if the drive is present in the drive bay
+         next unless (defined($disks{$key}{health}));			#skip any missing hash elements
+         if ( $disks{$key}{health} ne "GOOD" ){				#parse out disk health
+            $common_output_data = "$common_output_data $disks{$key}{drive_bay_description}_health:$disks{$key}{health} ";  #add a list the bad disk(s) to the output
+         }									#end of if block
+      }									#end of foreach loop
+      $output_message = "$CHECK_NAME WARN - Disk SMART error detected.  Please login to NAS web GUI and review the system health.   $common_output_data | $perf_data \n";
+      print "$output_message";     #print output to screen
+      print_to_outputfile;         #call subroutine to confirm the output is in the $outputfile used for subsequent script runs
+      send_email_alert;            #call subroutine to send email alert
+      exit $WARN;
+   }
+   #
+   # Alert on failed power supply 
+   #
+   if ( $nas{sysPowerStatus} ne "ok" ) {
+      $output_message = "$CHECK_NAME WARN - power supply error.  Please login to NAS web GUI and review the system health.   $common_output_data | $perf_data \n";
+      print "$output_message";     #print output to screen
+      print_to_outputfile;         #call subroutine to confirm the output is in the $outputfile used for subsequent script runs
+      send_email_alert;            #call subroutine to send email alert
+      exit $WARN;
+   }
+   #
+   # This message gets sent if everything is ok
+   #
+   $output_message = "$CHECK_NAME OK - $common_output_data | $perf_data \n";
+   print "$output_message";     #print output to screen
+   print_to_outputfile;         #call subroutine to confirm the output is in the $outputfile used for subsequent script runs
+   exit $OK;
+}                                                                       #end of subroutine
+
+
+
+# --------------------------- main body of program ----------------------
+get_options;
+sanity_checks;
+check_name_resolution;
+ping_remote_host;
+check_for_output_file;
+get_nas_details;
+get_disk_details; 
+print_output;
+
+
+
+
