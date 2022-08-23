@@ -13,7 +13,7 @@
 # ----------
 # 2022/06/02	njeffrey	Script created to monitor SMART disk metrics on QNAP NAS devices
 # 2022/07/16	njeffrey	SNMP queries will sometimes timeout if there is a disk failure, so execute this script from a cron job and create temporary file for reading to avoid nagios timeouts
-
+# 2022/07/16	njeffrey	Bug fix in performance data output
 
 # nagios shell script to query QNAP NAS devices to read SMART disk health metrics via SNMP
 
@@ -918,7 +918,7 @@ sub print_output {
    # 10:20              < 10 or > 20, (outside the range of {10 .. 20})
    # @10:20             ≥ 10 and ≤ 20, (inside the range of {10 .. 20})
    #
-   $perf_data = "AverageTemperatureC:$nas{disk_average_temperature_c};;;; AverageTemperatureF:$nas{disk_average_temperature_f};;;; fan_rpm:$nas{fan_rpm}";
+   $perf_data = "AverageTemperatureC=$nas{disk_average_temperature_c};;;; AverageTemperatureF=$nas{disk_average_temperature_f};;;; fan_rpm=$nas{fan_rpm}";
    #
    #
    # Much of the text of the output will be the same.  Put the common stuff in a variable so we can simplify the outputs
