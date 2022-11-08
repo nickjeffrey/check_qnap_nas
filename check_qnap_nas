@@ -669,25 +669,25 @@ sub get_disk_details {
    #
    # Now that we have the disk index values, capture the other disk metrics.
    # At this point, the hash looks like this:
-   #    $disk{1}{index}        = 1
-   #    $disk{2}{index}        = 2
+   #    $disk{1}{index}                  = 1
+   #    $disk{2}{index}                  = 2
    # And we want to get more values to make the hash look like this:
-   #    $disk{1}{index}         = 1
-   #            {description}   = "HDD1"
-   #            {temperature}   = "40 C/104 F"
-   #            {hdStatus}      = 0                      <---- 0=ready -4=unknown -5=noDisk -6=invalid -9=rwError
-   #            {drive_present} = "yes"                  <---- determine yes|no value based on value from hdStatus
-   #            {model}         = "ST8000NE0001-1WN112"
-   #            {size}          = "7.28 TB"
-   #            {health}        = "GOOD"
-   #    $disk{2}{index}         = 2
-   #            {description}   = "HDD1"
-   #            {temperature}   = "40 C/104 F"
-   #            {hdStatus}      = 0                      <---- 0=ready -4=unknown -5=noDisk -6=invalid -9=rwError
-   #            {drive_present} = "yes"                  <---- determine yes|no value based on value from hdStatus
-   #            {model}         = "ST8000NE0001-1WN112"
-   #            {size}          = "7.28 TB"
-   #            {health}        = "GOOD"
+   #    $disk{1}{index}                   = 1
+   #            {drive_bay_description}   = "HDD1"
+   #            {temperature}             = "40 C/104 F"
+   #            {hdStatus}                = 0                      <---- 0=ready -4=unknown -5=noDisk -6=invalid -9=rwError
+   #            {drive_present}           = "yes"                  <---- determine yes|no value based on value from hdStatus
+   #            {model}                   = "ST8000NE0001-1WN112"
+   #            {size}                    = "7.28 TB"
+   #            {health}                  = "GOOD"
+   #    $disk{2}{index}                   = 2
+   #            {drive_bay_description}   = "HDD1"
+   #            {temperature}             = "40 C/104 F"
+   #            {hdStatus}                = 0                      <---- 0=ready -4=unknown -5=noDisk -6=invalid -9=rwError
+   #            {drive_present}           = "yes"                  <---- determine yes|no value based on value from hdStatus
+   #            {model}                   = "ST8000NE0001-1WN112"
+   #            {size}                    = "7.28 TB"
+   #            {health}                  = "GOOD"
    #
    # 
    #
@@ -772,6 +772,7 @@ sub get_disk_details {
          $disks{$1}{drive_present} = "";						#initialize value
          $disks{$1}{drive_present} = "yes" if (($disks{$1}{hdStatus} eq "ready")   || ($disks{$1}{hdStatus} eq "rwError"));
          $disks{$1}{drive_present} = "no"  if (($disks{$1}{hdStatus} eq "unknown") || ($disks{$1}{hdStatus} eq "nodisk") || ($disks{$1}{hdStatus} eq "invalid"));
+         print "    setting disk $disks{$1}{drive_bay_description} hdStatus to $disks{$1}{hdStatus}   \n" if ($verbose eq "yes");
 
       } 										#end of if block
    }                                                                   		 	#end of while loop
@@ -919,6 +920,7 @@ sub print_output {
    # @10:20             ≥ 10 and ≤ 20, (inside the range of {10 .. 20})
    #
    $perf_data = "AverageTemperatureC=$nas{disk_average_temperature_c};;;; AverageTemperatureF=$nas{disk_average_temperature_f};;;; fan_rpm=$nas{fan_rpm}";
+   $perf_data = "AverageTemperatureC=$nas{disk_average_temperature_c};;;;";
    #
    #
    # Much of the text of the output will be the same.  Put the common stuff in a variable so we can simplify the outputs
@@ -946,7 +948,7 @@ sub print_output {
    #
    # Alert on physical disk I/O errors
    #
-   if ( $nas{hdStatus} ne "ok" ) {
+   if ( $nas{overall_hdStatus} ne "ok" ) {
       # find the BAD disk(s)
       foreach $key (sort keys %disks) {
          if ( ($disks{$key}{drive_present} eq "yes") && ($disks{$key}{hdStatus} ne "ready") ){			 		#check each present disk for errors
