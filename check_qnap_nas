@@ -14,6 +14,7 @@
 # 2022/06/02	njeffrey	Script created to monitor SMART disk metrics on QNAP NAS devices
 # 2022/07/16	njeffrey	SNMP queries will sometimes timeout if there is a disk failure, so execute this script from a cron job and create temporary file for reading to avoid nagios timeouts
 # 2022/07/16	njeffrey	Bug fix in performance data output
+# 2022/11/08	njeffrey	Instead of sending alert on first error found, keep track of all the errors and send one OK or WARN message 
 
 # nagios shell script to query QNAP NAS devices to read SMART disk health metrics via SNMP
 
@@ -208,6 +209,8 @@ sub get_options {
       print "Examples: \n";
       print "   $0 --host=myfiler --community=public \n";
       print "   $0     -H myfiler          -C public \n";
+      print "   $0 --verbose \n";
+      print "   $0 --help    \n";
       print "\n\n";
       exit $UNKNOWN;
    }
@@ -687,7 +690,7 @@ sub get_disk_details {
    #            {drive_present}           = "yes"                  <---- determine yes|no value based on value from hdStatus
    #            {model}                   = "ST8000NE0001-1WN112"
    #            {size}                    = "7.28 TB"
-   #            {health}                  = "GOOD"
+   #            {health}                  = "Abnormal"
    #
    # 
    #
@@ -833,9 +836,9 @@ sub get_disk_details {
    while (<IN>) {                                                       	#read a line from the command output
       #
       # looking for output similar to:  
-      #    .1.3.6.1.4.1.24681.1.2.11.1.7.1 = STRING: "GOOD"
-      #    .1.3.6.1.4.1.24681.1.2.11.1.7.2 = STRING: "GOOD"
-      #    .1.3.6.1.4.1.24681.1.2.11.1.7.3 = STRING: "--"
+      #    .1.3.6.1.4.1.24681.1.2.11.1.7.1 = STRING: "GOOD"			# <--- shows a disk that is normal and healthy
+      #    .1.3.6.1.4.1.24681.1.2.11.1.7.2 = STRING: "Abnormal"			# <--- indicates a disk with a physical problem
+      #    .1.3.6.1.4.1.24681.1.2.11.1.7.3 = STRING: "--"			# <--- indicates an empty drive bay or a drive so physically bad it cannot be detected
       #
       #
       s/"//g;									#get rid of " to make regex simpler
@@ -921,48 +924,37 @@ sub print_output {
    #
    $perf_data = "AverageTemperatureC=$nas{disk_average_temperature_c};;;; AverageTemperatureF=$nas{disk_average_temperature_f};;;; fan_rpm=$nas{fan_rpm}";
    $perf_data = "AverageTemperatureC=$nas{disk_average_temperature_c};;;;";
+   $output_message = "";		#initialize variable
    #
    #
    # Much of the text of the output will be the same.  Put the common stuff in a variable so we can simplify the outputs
    $common_output_data = "LogicalVolumes:$nas{sysvol_status} Disk_SMART_health:$nas{disk_smart_health} DriveBays:$nas{drive_bay_count} Disks:$nas{disk_count} AverageTemperature:$nas{disk_average_temperature_c}C/$nas{disk_average_temperature_f}F fan_count:$nas{fan_count} fan_rpm:$nas{fan_rpm} PowerSupply:$nas{sysPowerStatus} Model:$nas{model} Serial:$nas{serial}";
    #
-   # Alert on logical volume errors
+   # If there are any logical volume errors, put that detail in the front of the $output_message
    #
    if ( $nas{sysvol_status} ne "ok" ) {
-      $output_message = "$CHECK_NAME WARN - logical volume state is $nas{sysvol_status}.   $common_output_data | $perf_data \n";
-      print "$output_message";     #print output to screen
-      print_to_outputfile;         #call subroutine to confirm the output is in the $outputfile used for subsequent script runs
-      send_email_alert;            #call subroutine to send email alert
-      exit $WARN;
+      $output_message = " WARN - logical volume state is $nas{sysvol_status}. $output_message ";
    }
    #
-   # Alert on high average disk temperature
+   # If there are any high average disk temperatures, put that detail in the front of the $output_message
    #
    if ( $nas{disk_average_temperature_c} > 45 ) {
-      $output_message = "$CHECK_NAME WARN - average disk temperature is $nas{disk_average_temperature_c}C/$nas{disk_average_temperature_f}F.  The air conditioning or fans may have failed.   $common_output_data | $perf_data \n";
-      print "$output_message";     #print output to screen
-      print_to_outputfile;         #call subroutine to confirm the output is in the $outputfile used for subsequent script runs
-      send_email_alert;            #call subroutine to send email alert
-      exit $WARN;
+      $output_message = " WARN - average disk temperature is $nas{disk_average_temperature_c}C/$nas{disk_average_temperature_f}F.  The air conditioning or fans may have failed. $output_message ";
    }
    #
-   # Alert on physical disk I/O errors
+   # If there are any physical disk I/O errors, put that detail in the front of the $output_message
    #
    if ( $nas{overall_hdStatus} ne "ok" ) {
       # find the BAD disk(s)
       foreach $key (sort keys %disks) {
          if ( ($disks{$key}{drive_present} eq "yes") && ($disks{$key}{hdStatus} ne "ready") ){			 		#check each present disk for errors
             $common_output_data = "$disks{$key}{drive_bay_description}_hdStatus:$disks{$key}{hdStatus} $common_output_data";  	#add a list the bad disk(s) to the output
+            $output_message = " WARN - Disk hdStatus is $disks{$key}{hdStatus} in drive bay $disks{$key}{drive_bay_description}. $output_message ";
          }									#end of if block
       }									#end of foreach loop
-      $output_message = "$CHECK_NAME WARN - Disk hdStatus error detected.  Please login to NAS web GUI and review the system health.   $common_output_data | $perf_data \n";
-      print "$output_message";     #print output to screen
-      print_to_outputfile;         #call subroutine to confirm the output is in the $outputfile used for subsequent script runs
-      send_email_alert;            #call subroutine to send email alert
-      exit $WARN;
    }
    #
-   # Alert on SMART disk error
+   # If there are any physical disk SMART errors, put that detail in the front of the $output_message
    #
    if ( $nas{disk_smart_health} ne "GOOD" ) {
       # find the BAD disk(s)
@@ -971,31 +963,30 @@ sub print_output {
          next unless (defined($disks{$key}{health}));			#skip any missing hash elements
          if ( $disks{$key}{health} ne "GOOD" ){				#parse out disk health
             $common_output_data = "$common_output_data $disks{$key}{drive_bay_description}_health:$disks{$key}{health} ";  #add a list the bad disk(s) to the output
+            $output_message = " WARN - Disk SMART error detected on drive bay $disks{$key}{drive_bay_description}. $output_message ";
          }									#end of if block
       }									#end of foreach loop
-      $output_message = "$CHECK_NAME WARN - Disk SMART error detected.  Please login to NAS web GUI and review the system health.   $common_output_data | $perf_data \n";
-      print "$output_message";     #print output to screen
-      print_to_outputfile;         #call subroutine to confirm the output is in the $outputfile used for subsequent script runs
-      send_email_alert;            #call subroutine to send email alert
-      exit $WARN;
    }
    #
-   # Alert on failed power supply 
+   # If there are any failed power supply errors, put that detail in the front of the $output_message
    #
    if ( $nas{sysPowerStatus} ne "ok" ) {
-      $output_message = "$CHECK_NAME WARN - power supply error.  Please login to NAS web GUI and review the system health.   $common_output_data | $perf_data \n";
-      print "$output_message";     #print output to screen
-      print_to_outputfile;         #call subroutine to confirm the output is in the $outputfile used for subsequent script runs
-      send_email_alert;            #call subroutine to send email alert
-      exit $WARN;
+      $output_message = " WARN - power supply error. $output_message ";
    }
    #
    # This message gets sent if everything is ok
    #
-   $output_message = "$CHECK_NAME OK - $common_output_data | $perf_data \n";
-   print "$output_message";     #print output to screen
-   print_to_outputfile;         #call subroutine to confirm the output is in the $outputfile used for subsequent script runs
-   exit $OK;
+   if ( ($nas{sysvol_status} eq "ok") && ($nas{disk_average_temperature_c} <= 45) && ($nas{overall_hdStatus} eq "ok") && ($nas{disk_smart_health} eq "GOOD") && ($nas{sysPowerStatus} eq "ok") ) {
+      $output_message = "$CHECK_NAME OK - $output_message  $common_output_data | $perf_data \n";
+      print "$output_message";     #print output to screen
+      print_to_outputfile;         #call subroutine to confirm the output is in the $outputfile used for subsequent script runs
+      exit $OK;
+   }  else {
+      $output_message = "$CHECK_NAME WARN - $output_message  $common_output_data | $perf_data \n";
+      print "$output_message";     #print output to screen
+      print_to_outputfile;         #call subroutine to confirm the output is in the $outputfile used for subsequent script runs
+      exit $WARN;
+   }
 }                                                                       #end of subroutine
 
 
